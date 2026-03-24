@@ -5,6 +5,7 @@ Publishes pad hits to MQTT topics for ESP32 relay nodes to consume
 """
 
 import json
+import time
 from time import sleep
 import mido
 import logging
@@ -31,6 +32,8 @@ class Settings(BaseSettings):
     MIDI_CHANNEL: int = 9
     MIN_ON_MS: float = 100.
     MAX_ON_MS: float = 1000.
+    MAX_HIT_MS: float = 2000.  # Absolute max duration for a hit, even with re-hits
+    MIN_RETRIGGER_MS: float = 200.
     PAD_CONFIG: list[int] = [
         38,
         45,
@@ -93,19 +96,42 @@ def main():
 
     logging.info(f"Listening on: {port_name}  →  MQTT {MQTT_BROKER}:{MQTT_PORT}/{MQTT_BASE}/\n")
 
+    # Per-pad state for debounce
+    last_hit_time = {}
+    current_on_ms = {}
+
     with mido.open_input(port_name) as port:
         for msg in port:
             if msg.type != "note_on" or msg.channel != settings.MIDI_CHANNEL or msg.velocity == 0:
                 continue
             if msg.note not in settings.PAD_CONFIG:
                 continue
-            on_ms   = velocity_to_ms(msg.velocity)
-            topic   = f"{MQTT_BASE}/pad/{msg.note}"
+            
+            # Debounce logic: check if this pad is still in lockout window
+            now = time.monotonic()
+            new_on_ms = velocity_to_ms(msg.velocity)
+            elapsed = now - last_hit_time.get(msg.note, -float('inf'))
+            
+            if elapsed < settings.MIN_RETRIGGER_MS / 1000:
+                # Within lockout window: extend the on_ms (re-hit), capped at MAX_HIT_MS
+                on_ms = min(settings.MAX_HIT_MS, current_on_ms[msg.note] + new_on_ms)
+                is_extend = True
+            else:
+                # Fresh hit: outside lockout window
+                on_ms = new_on_ms
+                is_extend = False
+            
+            # Update state and publish
+            last_hit_time[msg.note] = now
+            current_on_ms[msg.note] = on_ms
+            
+            topic = f"{MQTT_BASE}/pad/{msg.note}"
             payload = int(on_ms)
-
             client.publish(topic, payload, qos=0)  # QoS 0 for lowest latency
+            
             logging.debug(msg)
-            logging.info(f"→ {topic}:{payload}")
+            action = "↻ extend" if is_extend else "→"
+            logging.info(f"{action} {topic}:{payload}")
 
     client.loop_stop()
     client.disconnect()
