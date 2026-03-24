@@ -5,40 +5,49 @@ Publishes pad hits to MQTT topics for ESP32 relay nodes to consume
 """
 
 import json
+from time import sleep
 import mido
 import logging
 import paho.mqtt.client as mqtt
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s: %(message)s',
-    level=logging.DEBUG
+    level=logging.INFO
     )
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-MQTT_BROKER   = "192.168.0.247"   # Run Mosquitto on the Pi itself
-MQTT_PORT     = 1883
-MQTT_BASE     = "drums"       # Topics will be drums/pad/<note>
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        # Use top level .env file (one level above ./backend/)
+        env_file="../.env",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
+    MQTT_BROKER: str = "192.168.0.247"
+    MQTT_PORT: int = 1883
+    MQTT_BASE: str = "drums"
+    MIDI_CHANNEL: int = 9
+    MIN_ON_MS: float = 20
+    MAX_ON_MS: float = 1000
+    PAD_CONFIG: list[int] = [
+        38,
+        45,
+        46,
+        48,
+        49,
+        51
+    ]
 
-PAD_CONFIG = {
-    38: {"name": "Snare"},
-    45: {"name": "HiHat_Closed"},
-    46: {"name": "HiHat_Open"},
-    48: {"name": "Crash"},
-    49: {"name": "Ride"},
-    51: {"name": "Tom_High"},
-}
-
-MIDI_CHANNEL  = 9
-MIN_ON_MS     = 20
-MAX_ON_MS     = 1000
+settings = Settings()
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def velocity_to_ms(velocity: int) -> float:
     v = max(1, min(127, velocity))
-    return MIN_ON_MS + (MAX_ON_MS - MIN_ON_MS) * ((v - 1) / 126)
+    return settings.MIN_ON_MS + (settings.MAX_ON_MS - settings.MIN_ON_MS) * ((v - 1) / 126)
 
 def select_port() -> str:
     ports = mido.get_input_names()
@@ -53,36 +62,44 @@ def select_port() -> str:
 # ─── MQTT Config Handler ─────────────────────────────────────────────────────
 
 def on_config(client, userdata, msg):
-    global MIN_ON_MS, MAX_ON_MS
     try:
         payload = json.loads(msg.payload.decode())
-        MIN_ON_MS     = payload.get("min_on_ms", MIN_ON_MS)
-        MAX_ON_MS     = payload.get("max_on_ms", MAX_ON_MS)
-        logging.info(f"Config updated: MIN_ON_MS={MIN_ON_MS}, MAX_ON_MS={MAX_ON_MS}")
+        logging.debug(f"Received config update: {payload}")
+        incoming = Settings.model_construct(**{
+            **settings.model_dump(),
+            "MIN_ON_MS": payload.get("min_on_ms", settings.MIN_ON_MS),
+            "MAX_ON_MS": payload.get("max_on_ms", settings.MAX_ON_MS),
+        })
+        if incoming == settings:
+            return
+        settings.MIN_ON_MS = incoming.MIN_ON_MS
+        settings.MAX_ON_MS = incoming.MAX_ON_MS
+        logging.info(f"Config updated: MIN_ON_MS={settings.MIN_ON_MS}, MAX_ON_MS={settings.MAX_ON_MS}")
     except Exception as e:
         logging.error(f"Error processing config message: {e}")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="midi-bridge")
-    client.connect(MQTT_BROKER, MQTT_PORT)
-    client.subscribe(f"{MQTT_BASE}/#")
-    client.message_callback_add(f"{MQTT_BASE}/config", on_config)
-    client.loop_start()
-    client.publish(f"{MQTT_BASE}/config", json.dumps({"min_on_ms": MIN_ON_MS, "max_on_ms": MAX_ON_MS}), qos=0, retain=True)
-
     port_name = select_port()
-    logging.info(f"Listening on: {port_name}  →  MQTT {MQTT_BROKER}:{MQTT_PORT}/{MQTT_BASE}/\n")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="midi-bridge")
+    client.connect(settings.MQTT_BROKER, settings.MQTT_PORT)
+    client.subscribe(f"{settings.MQTT_BASE}/#")
+    client.message_callback_add(f"{settings.MQTT_BASE}/config", on_config)
+    client.loop_start()
+    sleep(1)  # Allow time for MQTT connection to establish
+    client.publish(f"{settings.MQTT_BASE}/config", json.dumps({"min_on_ms": settings.MIN_ON_MS, "max_on_ms": settings.MAX_ON_MS}), qos=0, retain=True)
+
+    logging.info(f"Listening on: {port_name}  →  MQTT {settings.MQTT_BROKER}:{settings.MQTT_PORT}/{settings.MQTT_BASE}/\n")
 
     with mido.open_input(port_name) as port:
         for msg in port:
-            if msg.type != "note_on" or msg.channel != MIDI_CHANNEL or msg.velocity == 0:
+            if msg.type != "note_on" or msg.channel != settings.MIDI_CHANNEL or msg.velocity == 0:
                 continue
-            if msg.note not in PAD_CONFIG:
+            if msg.note not in settings.PAD_CONFIG:
                 continue
             on_ms   = velocity_to_ms(msg.velocity)
-            topic   = f"{MQTT_BASE}/pad/{msg.note}"
+            topic   = f"{settings.MQTT_BASE}/pad/{msg.note}"
             payload = round(on_ms, 1)
 
             client.publish(topic, payload, qos=0)  # QoS 0 for lowest latency
