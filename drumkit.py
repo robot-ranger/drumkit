@@ -11,9 +11,8 @@ import mido
 import logging
 import dotenv
 import os
-import RPi.GPIO as GPIO
 import paho.mqtt.client as mqtt
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s: %(message)s',

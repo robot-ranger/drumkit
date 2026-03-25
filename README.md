@@ -15,6 +15,8 @@ Install Python dependencies in your virtual environment:
 python -m pip install -r requirements.txt
 ```
 
+For one-command setup (system deps + venv + Python deps), run `./bootstrap.sh` from the project root.
+
 Run the MIDI input test:
 
 ```bash
