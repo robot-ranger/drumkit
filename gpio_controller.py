@@ -195,7 +195,7 @@ class GPIOController:
                 state.timer.cancel()
 
             GPIO.output(pin, GPIO.LOW)
-            self._client.publish(f"{MQTT_BASE}/poofer/{note}", effective_on_ms, qos=0, retain=False)
+            self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", effective_on_ms, qos=0, retain=False)
             state.cooldown_on_generation = (
                 generation if effective_on_ms >= remaining_budget_ms else None
             )
@@ -225,7 +225,7 @@ class GPIOController:
                 return
 
             GPIO.output(pin, GPIO.HIGH)
-            self._client.publish(f"{MQTT_BASE}/poofer/{note}", 0, qos=0, retain=False)
+            self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
             state.timer = None
             state.opened_at = None
             if state.cooldown_on_generation == generation:
@@ -245,7 +245,7 @@ class GPIOController:
             state.timer.cancel()
             state.timer = None
         GPIO.output(pin, GPIO.HIGH)
-        self._client.publish(f"{MQTT_BASE}/poofer/{note}", 0, qos=0, retain=False)
+        self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
         state.opened_at = None
         state.generation += 1
         state.cooldown_on_generation = None
