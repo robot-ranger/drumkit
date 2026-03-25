@@ -88,11 +88,10 @@ def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="midi-bridge")
     client.connect(MQTT_BROKER, MQTT_PORT)
     client.subscribe(f"{MQTT_BASE}/#")
-    client.subscribe(f"{MQTT_BASE}/")
     client.message_callback_add(f"{MQTT_BASE}", on_config)
     client.loop_start()
     sleep(1)  # Allow time for MQTT connection to establish
-    client.publish(f"{MQTT_BASE}", settings.model_dump_json(), qos=0, retain=True)
+    client.publish(f"{MQTT_BASE}/pad", settings.model_dump_json(), qos=0, retain=True)
 
     logging.info(f"Listening on: {port_name}  →  MQTT {MQTT_BROKER}:{MQTT_PORT}/{MQTT_BASE}/\n")
 

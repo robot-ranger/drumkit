@@ -9,8 +9,10 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import os
+import time
 from dataclasses import dataclass
-
+import json
 import dotenv
 import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
@@ -22,12 +24,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+# ─── env ───────────────────────────────────────────────────────────────────
+
+dotenv.load_dotenv()
+MQTT_BROKER: str = str(os.getenv("MQTT_BROKER", "localhost"))
+MQTT_PORT: int = int(os.getenv("MQTT_PORT", 1883))
+MQTT_BASE: str = str(os.getenv("MQTT_BASE", "drums"))
+MQTT_POOFER_TOPIC: str = f"{MQTT_BASE}/poofer"
+
+# ─── DrumKit Config ───────────────────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
-    MQTT_BROKER: str = "localhost"
-    MQTT_PORT: int = 1883
-    MQTT_BASE: str = "drums"
-
     # Relay board wiring for 6 pads (active-low outputs).
     PAD_GPIO_MAP: dict[int, int] = {
         38: 5,
@@ -37,14 +44,17 @@ class Settings(BaseSettings):
         49: 20,
         51: 13,
     }
-
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    MAX_ON_MS: int = 2000
+    COOLDOWN_MS: int = 2000
 
 
 @dataclass
 class PadState:
     timer: threading.Timer | None = None
     generation: int = 0
+    opened_at: float | None = None
+    cooldown_until: float = 0.0
+    cooldown_on_generation: int | None = None
 
 
 class GPIOController:
@@ -76,11 +86,11 @@ class GPIOController:
     def connect(self) -> None:
         logging.info(
             "Connecting to MQTT broker at %s:%s, base topic '%s'",
-            self.settings.MQTT_BROKER,
-            self.settings.MQTT_PORT,
-            self.settings.MQTT_BASE,
+            MQTT_BROKER,
+            MQTT_PORT,
+            MQTT_BASE,
         )
-        self._client.connect(self.settings.MQTT_BROKER, self.settings.MQTT_PORT)
+        self._client.connect(MQTT_BROKER, MQTT_PORT)
 
     def run(self) -> None:
         self.setup_gpio()
@@ -109,9 +119,35 @@ class GPIOController:
         reason_code,
         properties,
     ) -> None:
-        topic = f"{self.settings.MQTT_BASE}/pad/+"
-        client.subscribe(topic, qos=0)
-        logging.info("Subscribed to %s", topic)
+        client.message_callback_add(MQTT_POOFER_TOPIC, self._on_config)
+        client.message_callback_add(f"{MQTT_BASE}/pad/+", self._on_message)
+        topics = [
+            (f"{MQTT_BASE}/pad/+", 0),
+            (MQTT_POOFER_TOPIC, 0)
+        ]
+        client.subscribe(topics)
+        logging.info("Subscribed to %s", topics)
+        client.publish(MQTT_POOFER_TOPIC, self.settings.model_dump_json(), qos=0, retain=True)
+
+    # ─── On Config Callback ──────────────────────────────────────────────────────
+
+    def _on_config(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            logging.debug(f"Received config update from {MQTT_BASE}/poofer: {payload}")
+            incoming = Settings.model_validate({
+                **self.settings.model_dump(),
+                **payload
+            })
+            if incoming == self.settings:
+                logging.debug("Config update matches current settings, ignoring.")
+                return
+            self.settings = incoming
+            logging.info(f"Config updated : {self.settings}")
+        except Exception as e:
+            logging.error(f"Error processing config message from {MQTT_BASE}/poofer: {e}")
+
+    # ─── On Message Callback ─────────────────────────────────────────────────────
 
     def _on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage) -> None:
         try:
@@ -129,7 +165,29 @@ class GPIOController:
             return
 
         with self._lock:
+            now = time.monotonic()
             state = self._pad_state[note]
+
+            if now < state.cooldown_until:
+                remaining_ms = int((state.cooldown_until - now) * 1000)
+                logging.debug(
+                    "Ignoring note=%s pin=%s while in cooldown (%sms remaining)",
+                    note,
+                    pin,
+                    max(0, remaining_ms),
+                )
+                return
+
+            if state.opened_at is None:
+                state.opened_at = now
+
+            elapsed_ms = int((now - state.opened_at) * 1000)
+            remaining_budget_ms = self.settings.MAX_ON_MS - elapsed_ms
+            if remaining_budget_ms <= 0:
+                self._start_cooldown_locked(note, pin, state)
+                return
+
+            effective_on_ms = min(on_ms, remaining_budget_ms)
             state.generation += 1
             generation = state.generation
 
@@ -137,9 +195,13 @@ class GPIOController:
                 state.timer.cancel()
 
             GPIO.output(pin, GPIO.LOW)
+            self._client.publish(f"{MQTT_BASE}/poofer/{note}", effective_on_ms, qos=0, retain=False)
+            state.cooldown_on_generation = (
+                generation if effective_on_ms >= remaining_budget_ms else None
+            )
 
             timer = threading.Timer(
-                on_ms / 1000.0,
+                effective_on_ms / 1000.0,
                 self._deactivate_pad_if_current,
                 args=(note, generation),
             )
@@ -147,7 +209,13 @@ class GPIOController:
             timer.start()
             state.timer = timer
 
-        logging.info("Activated note=%s pin=%s for %sms", note, pin, on_ms)
+        logging.info(
+            "Activated note=%s pin=%s for %sms (requested=%sms)",
+            note,
+            pin,
+            effective_on_ms,
+            on_ms,
+        )
 
     def _deactivate_pad_if_current(self, note: int, generation: int) -> None:
         pin = self.settings.PAD_GPIO_MAP[note]
@@ -157,9 +225,38 @@ class GPIOController:
                 return
 
             GPIO.output(pin, GPIO.HIGH)
+            self._client.publish(f"{MQTT_BASE}/poofer/{note}", 0, qos=0, retain=False)
             state.timer = None
+            state.opened_at = None
+            if state.cooldown_on_generation == generation:
+                state.cooldown_until = time.monotonic() + (self.settings.COOLDOWN_MS / 1000.0)
+                state.cooldown_on_generation = None
+                logging.warning(
+                    "Max-on reached for note=%s pin=%s; entering cooldown for %sms",
+                    note,
+                    pin,
+                    self.settings.COOLDOWN_MS,
+                )
 
         logging.debug("Deactivated note=%s pin=%s", note, pin)
+
+    def _start_cooldown_locked(self, note: int, pin: int, state: PadState) -> None:
+        if state.timer is not None:
+            state.timer.cancel()
+            state.timer = None
+        GPIO.output(pin, GPIO.HIGH)
+        self._client.publish(f"{MQTT_BASE}/poofer/{note}", 0, qos=0, retain=False)
+        state.opened_at = None
+        state.generation += 1
+        state.cooldown_on_generation = None
+        state.cooldown_until = time.monotonic() + (self.settings.COOLDOWN_MS / 1000.0)
+        logging.warning(
+            "Force-closing note=%s pin=%s after max-on %sms; cooldown %sms",
+            note,
+            pin,
+            self.settings.MAX_ON_MS,
+            self.settings.COOLDOWN_MS,
+        )
 
     def _parse_note_from_topic(self, topic: str) -> int:
         parts = topic.split("/")
