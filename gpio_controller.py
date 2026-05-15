@@ -6,17 +6,17 @@ Subscribes to pad hit topics and actuates active-low relays for the requested du
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import signal
-import threading
 import os
 import time
 from dataclasses import dataclass
 import json
 import dotenv
-import paho.mqtt.client as mqtt
+import aiomqtt
 import RPi.GPIO as GPIO
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
 
 
 logging.basicConfig(
@@ -46,31 +46,23 @@ class Settings(BaseSettings):
     }
     MAX_ON_MS: int = 2000
     COOLDOWN_MS: int = 2000
+    OVERRIDE_MODE: bool = False  # If True, ignores MAX_ON_MS and COOLDOWN_MS for testing
 
 
 @dataclass
 class PadState:
-    timer: threading.Timer | None = None
-    generation: int = 0
+    timer: asyncio.Task | None = None
     opened_at: float | None = None
     cooldown_until: float = 0.0
-    cooldown_on_generation: int | None = None
 
 
 class GPIOController:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._lock = threading.RLock()
-        self._stopped = False
         self._pad_state: dict[int, PadState] = {
             note: PadState() for note in self.settings.PAD_GPIO_MAP
         }
-        self._client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2,
-            client_id="gpio-controller",
-        )
-        self._client.on_connect = self._on_connect
-        self._client.on_message = self._on_message
+        self._client: aiomqtt.Client | None = None
 
     def setup_gpio(self) -> None:
         GPIO.setwarnings(False)
@@ -83,172 +75,198 @@ class GPIOController:
 
         logging.info("GPIO initialized (active-low relays): %s", self.settings.PAD_GPIO_MAP)
 
-    def connect(self) -> None:
+    def run(self) -> None:
+        asyncio.run(self._run_async())
+
+    async def _run_async(self) -> None:
+        self.setup_gpio()
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.current_task()
+
+        def _signal_handler() -> None:
+            if main_task:
+                main_task.cancel()
+
+        loop.add_signal_handler(signal.SIGINT, _signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+
         logging.info(
             "Connecting to MQTT broker at %s:%s, base topic '%s'",
             MQTT_BROKER,
             MQTT_PORT,
             MQTT_BASE,
         )
-        self._client.connect(MQTT_BROKER, MQTT_PORT)
 
-    def run(self) -> None:
-        self.setup_gpio()
-        self.connect()
-        self._client.loop_forever()
+        try:
+            async with aiomqtt.Client(
+                MQTT_BROKER,
+                MQTT_PORT,
+                identifier="gpio-controller",
+            ) as client:
+                self._client = client
+                await client.subscribe(f"{MQTT_BASE}/pad/+")
+                await client.subscribe(MQTT_POOFER_TOPIC)
+                await client.publish(
+                    MQTT_POOFER_TOPIC,
+                    self.settings.model_dump_json(),
+                    qos=0,
+                    retain=True,
+                )
+                logging.info(
+                    "Subscribed to %s/pad/+ and %s",
+                    MQTT_BASE,
+                    MQTT_POOFER_TOPIC,
+                )
+                async for message in client.messages:
+                    topic = str(message.topic)
+                    if topic == MQTT_POOFER_TOPIC:
+                        await self._on_config(message)
+                    else:
+                        await self._on_message(message)
+        except asyncio.CancelledError:
+            logging.info("Shutdown signal received")
+        finally:
+            await self._shutdown()
 
-    def stop(self) -> None:
-        with self._lock:
-            if self._stopped:
-                return
-            self._stopped = True
-
-            for state in self._pad_state.values():
-                if state.timer is not None:
-                    state.timer.cancel()
-                    state.timer = None
-        self._client.disconnect()
+    async def _shutdown(self) -> None:
+        for state in self._pad_state.values():
+            if state.timer is not None:
+                state.timer.cancel()
+                state.timer = None
+        for pin in set(self.settings.PAD_GPIO_MAP.values()):
+            try:
+                GPIO.output(pin, GPIO.HIGH)
+            except Exception:
+                pass
         GPIO.cleanup()
         logging.info("GPIO controller stopped cleanly")
 
-    def _on_connect(
-        self,
-        client: mqtt.Client,
-        userdata,
-        flags,
-        reason_code,
-        properties,
-    ) -> None:
-        client.message_callback_add(MQTT_POOFER_TOPIC, self._on_config)
-        client.message_callback_add(f"{MQTT_BASE}/pad/+", self._on_message)
-        topics = [
-            (f"{MQTT_BASE}/pad/+", 0),
-            (MQTT_POOFER_TOPIC, 0)
-        ]
-        client.subscribe(topics)
-        logging.info("Subscribed to %s", topics)
-        client.publish(MQTT_POOFER_TOPIC, self.settings.model_dump_json(), qos=0, retain=True)
-
     # ─── On Config Callback ──────────────────────────────────────────────────────
 
-    def _on_config(self, client, userdata, msg):
+    async def _on_config(self, message: aiomqtt.Message) -> None:
         try:
-            payload = json.loads(msg.payload.decode())
-            logging.debug(f"Received config update from {MQTT_BASE}/poofer: {payload}")
+            payload = json.loads(message.payload.decode())
+            logging.debug("Received config update from %s: %s", MQTT_POOFER_TOPIC, payload)
             incoming = Settings.model_validate({
                 **self.settings.model_dump(),
-                **payload
+                **payload,
             })
             if incoming == self.settings:
                 logging.debug("Config update matches current settings, ignoring.")
                 return
             self.settings = incoming
-            logging.info(f"Config updated : {self.settings}")
+            logging.info("Config updated: %s", self.settings)
         except Exception as e:
-            logging.error(f"Error processing config message from {MQTT_BASE}/poofer: {e}")
+            logging.error("Error processing config message from %s: %s", MQTT_POOFER_TOPIC, e)
 
     # ─── On Message Callback ─────────────────────────────────────────────────────
 
-    def _on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage) -> None:
+    async def _on_message(self, message: aiomqtt.Message) -> None:
         try:
-            note = self._parse_note_from_topic(msg.topic)
-            on_ms = int(float(msg.payload.decode().strip()))
+            note = self._parse_note_from_topic(str(message.topic))
+            on_ms = int(float(message.payload.decode().strip()))
+            if on_ms == 0:
+                await self._deactivate_pad(note)
+                return
             on_ms = max(1, on_ms)
-            self._activate_pad(note, on_ms)
+            await self._activate_pad(note, on_ms)
         except Exception as exc:
-            logging.error("Ignoring malformed message topic=%s payload=%r error=%s", msg.topic, msg.payload, exc)
+            logging.error(
+                "Ignoring malformed message topic=%s payload=%r error=%s",
+                message.topic,
+                message.payload,
+                exc,
+            )
 
-    def _activate_pad(self, note: int, on_ms: int) -> None:
+    async def _deactivate_pad(self, note: int) -> None:
+        pin = self.settings.PAD_GPIO_MAP.get(note)
+        if pin is None:
+            logging.warning("No GPIO mapping configured for note %s", note)
+            return
+        state = self._pad_state[note]
+        if state.timer is not None:
+            state.timer.cancel()
+            state.timer = None
+        GPIO.output(pin, GPIO.HIGH)
+        await self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
+        state.opened_at = None
+        logging.info("Deactivated note=%s pin=%s (received 0)", note, pin)
+
+    async def _activate_pad(self, note: int, on_ms: int) -> None:
         pin = self.settings.PAD_GPIO_MAP.get(note)
         if pin is None:
             logging.warning("No GPIO mapping configured for note %s", note)
             return
 
-        with self._lock:
-            now = time.monotonic()
-            state = self._pad_state[note]
+        now = time.monotonic()
+        state = self._pad_state[note]
 
-            if now < state.cooldown_until:
-                remaining_ms = int((state.cooldown_until - now) * 1000)
-                logging.debug(
-                    "Ignoring note=%s pin=%s while in cooldown (%sms remaining)",
-                    note,
-                    pin,
-                    max(0, remaining_ms),
-                )
-                return
-
-            if state.opened_at is None:
-                state.opened_at = now
-
-            elapsed_ms = int((now - state.opened_at) * 1000)
-            remaining_budget_ms = self.settings.MAX_ON_MS - elapsed_ms
-            if remaining_budget_ms <= 0:
-                self._start_cooldown_locked(note, pin, state)
-                return
-
-            effective_on_ms = min(on_ms, remaining_budget_ms)
-            state.generation += 1
-            generation = state.generation
-
-            if state.timer is not None:
-                state.timer.cancel()
-
-            GPIO.output(pin, GPIO.LOW)
-            self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", effective_on_ms, qos=0, retain=False)
-            state.cooldown_on_generation = (
-                generation if effective_on_ms >= remaining_budget_ms else None
+        if now < state.cooldown_until:
+            remaining_ms = int((state.cooldown_until - now) * 1000)
+            logging.debug(
+                "Ignoring note=%s pin=%s while in cooldown (%sms remaining)",
+                note,
+                pin,
+                max(0, remaining_ms),
             )
+            return
 
-            timer = threading.Timer(
-                effective_on_ms / 1000.0,
-                self._deactivate_pad_if_current,
-                args=(note, generation),
-            )
-            timer.daemon = True
-            timer.start()
-            state.timer = timer
+        if state.opened_at is None:
+            state.opened_at = now
 
-        logging.info(
-            "Activated note=%s pin=%s for %sms (requested=%sms)",
-            note,
-            pin,
-            effective_on_ms,
-            on_ms,
+        elapsed_ms = int((now - state.opened_at) * 1000)
+        remaining_budget_ms = self.settings.MAX_ON_MS - elapsed_ms
+        if remaining_budget_ms <= 0:
+            await self._start_cooldown(note, pin, state)
+            return
+
+        effective_on_ms = min(on_ms, remaining_budget_ms)
+        should_cooldown = effective_on_ms >= remaining_budget_ms
+
+
+        if state.timer is not None:
+            state.timer.cancel()
+
+        GPIO.output(pin, GPIO.LOW)
+        await self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", effective_on_ms, qos=0, retain=False)
+        state.timer = asyncio.create_task(
+            self._deactivate_after(note, pin, effective_on_ms / 1000.0, should_cooldown)
         )
 
-    def _deactivate_pad_if_current(self, note: int, generation: int) -> None:
-        pin = self.settings.PAD_GPIO_MAP[note]
-        with self._lock:
-            state = self._pad_state[note]
-            if state.generation != generation:
-                return
+        logging.info(
+            f"Activated poofer pin={pin} for {effective_on_ms}ms (requested={on_ms}ms)"
+        )
 
-            GPIO.output(pin, GPIO.HIGH)
-            self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
-            state.timer = None
-            state.opened_at = None
-            if state.cooldown_on_generation == generation:
-                state.cooldown_until = time.monotonic() + (self.settings.COOLDOWN_MS / 1000.0)
-                state.cooldown_on_generation = None
-                logging.warning(
-                    "Max-on reached for note=%s pin=%s; entering cooldown for %sms",
-                    note,
-                    pin,
-                    self.settings.COOLDOWN_MS,
-                )
+    async def _deactivate_after(
+        self, note: int, pin: int, delay_s: float, start_cooldown: bool
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return  # Re-activation cancelled us; relay stays LOW under new task
 
+        GPIO.output(pin, GPIO.HIGH)
+        await self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
+        state = self._pad_state[note]
+        state.timer = None
+        state.opened_at = None
+        if start_cooldown:
+            state.cooldown_until = time.monotonic() + (self.settings.COOLDOWN_MS / 1000.0)
+            logging.warning(
+                "Max-on reached for note=%s pin=%s; entering cooldown for %sms",
+                note,
+                pin,
+                self.settings.COOLDOWN_MS,
+            )
         logging.debug("Deactivated note=%s pin=%s", note, pin)
 
-    def _start_cooldown_locked(self, note: int, pin: int, state: PadState) -> None:
+    async def _start_cooldown(self, note: int, pin: int, state: PadState) -> None:
         if state.timer is not None:
             state.timer.cancel()
             state.timer = None
         GPIO.output(pin, GPIO.HIGH)
-        self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
+        await self._client.publish(f"{MQTT_POOFER_TOPIC}/{pin}", 0, qos=0, retain=False)
         state.opened_at = None
-        state.generation += 1
-        state.cooldown_on_generation = None
         state.cooldown_until = time.monotonic() + (self.settings.COOLDOWN_MS / 1000.0)
         logging.warning(
             "Force-closing note=%s pin=%s after max-on %sms; cooldown %sms",
@@ -271,24 +289,7 @@ def main() -> None:
     dotenv.load_dotenv()
     settings = Settings()
     controller = GPIOController(settings)
-
-    stop_event = threading.Event()
-
-    def _handle_signal(signum, frame) -> None:
-        logging.info("Received signal %s", signum)
-        stop_event.set()
-        controller.stop()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    try:
-        controller.run()
-    except KeyboardInterrupt:
-        controller.stop()
-    except Exception:
-        controller.stop()
-        raise
+    controller.run()
 
 
 if __name__ == "__main__":

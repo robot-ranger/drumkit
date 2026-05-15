@@ -31,8 +31,7 @@ MQTT_BASE: str = str(os.getenv("MQTT_BASE", "drums"))
 class Settings(BaseSettings):
     MIDI_CHANNEL: int = 9
     MIN_ON_MS: float = 100.
-    MAX_ON_MS: float = 1000.
-    MAX_HIT_MS: float = 2000.  # Absolute max duration for a hit, even with re-hits
+    MAX_ON_MS: float = 500.
     MIN_RETRIGGER_MS: float = 200.
     PAD_CONFIG: list[int] = [
         38,
@@ -83,7 +82,8 @@ def on_config(client, userdata, msg):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    port_name = select_port()
+    # port_name = select_port()
+    port_name = "Stryke 6:Stryke 6 MIDI 1 16:0"  # DEV OVERRIDE
     logging.info(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} with base topic '{MQTT_BASE}/'")
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="midi-bridge")
     client.connect(MQTT_BROKER, MQTT_PORT)
@@ -113,7 +113,7 @@ def main():
             
             if elapsed < settings.MIN_RETRIGGER_MS / 1000:
                 # Within lockout window: extend the on_ms (re-hit), capped at MAX_HIT_MS
-                on_ms = min(settings.MAX_HIT_MS, current_on_ms[msg.note] + new_on_ms)
+                on_ms = current_on_ms[msg.note] + new_on_ms
                 is_extend = True
             else:
                 # Fresh hit: outside lockout window
@@ -129,7 +129,7 @@ def main():
             client.publish(topic, payload, qos=0)  # QoS 0 for lowest latency
             
             logging.debug(msg)
-            action = "↻ extend" if is_extend else "→"
+            action = "↻ extend" if is_extend else "Activated Note →"
             logging.info(f"{action} {topic}:{payload}")
 
     client.loop_stop()

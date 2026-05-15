@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drumkit Control</title>
+  <link rel="stylesheet" href="/vendor/bootstrap.min.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <nav class="navbar navbar-custom px-4 mb-4 d-flex justify-content-between align-items-center">
+    <span class="fw-bold fs-5">&#x1F941; Drumkit Control</span>
+    <span id="mqttStatus" class="badge bg-secondary">Connecting&hellip;</span>
+  </nav>
+
+  <div class="container-fluid px-4" style="max-width:700px">
+
+    <!-- ── Trigger control ─────────────────────────────────── -->
+    <div class="d-flex align-items-center gap-3 mb-3">
+      <div>
+        <label class="form-label small mb-1">Trigger (ms)</label>
+        <input type="number" id="triggerMs" class="form-control form-control-sm"
+               value="200" min="1" max="5000" style="width:90px">
+      </div>
+      <div class="text small mt-3">Click a pad to fire its relay</div>
+    </div>
+
+    <!-- ── Pad grid 2×3 ───────────────────────────────────── -->
+    <div id="padGrid" class="row row-cols-3 g-3 mb-4"></div>
+    <!-- All Off button -->
+    <div class="row">
+        <button id="allOffBtn" class="btn btn-danger btn-xl mx-auto p-3 mb-3" style="max-width: 250px;">ALL OFF</button>
+    </div>
+    <!-- ── Config accordion ───────────────────────────────── -->
+    <div class="accordion mb-4" id="configAccordion">
+
+      <!-- Drumkit config -->
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed" type="button"
+                  data-bs-toggle="collapse" data-bs-target="#drumkitCollapse">
+            Drumkit Config
+          </button>
+        </h2>
+        <div id="drumkitCollapse" class="accordion-collapse collapse">
+          <div class="accordion-body">
+            <form id="drumkitForm">
+              <div class="row g-3 mb-3">
+                <div class="col-6">
+                  <label class="form-label small">MIDI_CHANNEL</label>
+                  <input type="number" class="form-control form-control-sm" id="dk_MIDI_CHANNEL" value="9">
+                </div>
+                <div class="col-6">
+                  <label class="form-label small">MIN_ON_MS</label>
+                  <input type="number" class="form-control form-control-sm" id="dk_MIN_ON_MS" value="100" step="any">
+                </div>
+                <div class="col-6">
+                  <label class="form-label small">MAX_ON_MS</label>
+                  <input type="number" class="form-control form-control-sm" id="dk_MAX_ON_MS" value="500" step="any">
+                </div>
+                <div class="col-6">
+                  <label class="form-label small">MIN_RETRIGGER_MS</label>
+                  <input type="number" class="form-control form-control-sm" id="dk_MIN_RETRIGGER_MS" value="200" step="any">
+                </div>
+                <div class="col-12">
+                  <label class="form-label small">PAD_CONFIG (comma-separated note numbers)</label>
+                  <input type="text" class="form-control form-control-sm" id="dk_PAD_CONFIG" value="38,45,46,48,49,51">
+                </div>
+              </div>
+              <button type="submit" class="btn btn-sm btn-primary">Save Drumkit Config</button>
+              <span id="drumkitSaveStatus" class="ms-2 small text-success d-none">Saved</span>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- GPIO controller config -->
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed" type="button"
+                  data-bs-toggle="collapse" data-bs-target="#gpioCollapse">
+            GPIO Controller Config
+          </button>
+        </h2>
+        <div id="gpioCollapse" class="accordion-collapse collapse">
+          <div class="accordion-body">
+            <form id="gpioForm">
+              <div class="row g-3 mb-3">
+                <div class="col-6">
+                  <label class="form-label small">MAX_ON_MS</label>
+                  <input type="number" class="form-control form-control-sm" id="gp_MAX_ON_MS" value="2000">
+                </div>
+                <div class="col-6">
+                  <label class="form-label small">COOLDOWN_MS</label>
+                  <input type="number" class="form-control form-control-sm" id="gp_COOLDOWN_MS" value="2000">
+                </div>
+                <div class="col-12">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="gp_OVERRIDE_MODE">
+                    <label class="form-check-label small" for="gp_OVERRIDE_MODE">
+                      OVERRIDE_MODE &mdash; ignore MAX_ON_MS &amp; COOLDOWN_MS (testing only)
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <label class="form-label small">PAD_GPIO_MAP (Note &rarr; BCM Pin)</label>
+              <table class="table table-sm table-dark mb-3">
+                <thead><tr><th class="text-muted">Note</th><th class="text-muted">GPIO Pin</th></tr></thead>
+                <tbody id="padMapTable"></tbody>
+              </table>
+              <button type="submit" class="btn btn-sm btn-primary">Save GPIO Config</button>
+              <span id="gpioSaveStatus" class="ms-2 small text-success d-none">Saved</span>
+            </form>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /accordion -->
+  </div><!-- /container -->
+
+  <script src="/vendor/bootstrap.bundle.min.js"></script>
+  <script src="/vendor/mqtt.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,6 +1,5 @@
 services: 
   mosquitto:
-    container_name: mosquitto
     image: eclipse-mosquitto:latest
     restart: unless-stopped
     ports:
@@ -14,3 +13,53 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
+
+  drumkit:
+      build: 
+        context: .
+        dockerfile: Dockerfile.drumkit
+      restart: unless-stopped
+      environment:
+        - MQTT_BROKER=mosquitto
+        - MQTT_PORT=1883
+        - MQTT_BASE=drums
+      devices:
+        - /dev/bus/usb:/dev/bus/usb   # all USB, or narrow to a specific device
+        - /dev/snd:/dev/snd           # ALSA sequencer for MIDI
+      depends_on:
+        mosquitto:
+          condition: service_healthy
+  gpio:
+      build: 
+        context: .
+        dockerfile: Dockerfile.gpio
+      restart: unless-stopped
+      environment:
+        - MQTT_BROKER=mosquitto
+        - MQTT_PORT=1883
+        - MQTT_BASE=drums
+        - RPI_LGPIO_REVISION=00c04170  # Pi hardware revision (replaces /proc/device-tree bind-mount)
+      devices:
+        - /dev/gpiochip0:/dev/gpiochip0  # GPIO access for Raspberry Pi
+      depends_on:
+        mosquitto:
+          condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    ports:
+      - '8000:80'
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+
+  dozzle:
+    image: amir20/dozzle:latest
+    restart: unless-stopped
+    ports:
+      - '8080:8080'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

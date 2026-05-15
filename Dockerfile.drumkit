@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+# python-rtmidi requires ALSA headers to build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2-dev \
+    gcc \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    mido \
+    python-rtmidi \
+    python-dotenv \
+    paho-mqtt \
+    pydantic-settings
+
+COPY drumkit.py .
+
+CMD ["python", "drumkit.py"]
