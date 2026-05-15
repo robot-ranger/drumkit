@@ -45,6 +45,7 @@ function triggerPad(note) {
 }
 
 function allOff() {
+  cancelRandom();
   NOTES.forEach(note => client.publish(`${MQTT_BASE}/pad/${note}`, '0'));
 }
 
@@ -94,6 +95,10 @@ function populateDrumkitForm(cfg) {
   set('dk_MIN_RETRIGGER_MS', cfg.MIN_RETRIGGER_MS);
   if (Array.isArray(cfg.PAD_CONFIG))
     document.getElementById('dk_PAD_CONFIG').value = cfg.PAD_CONFIG.join(', ');
+  if (cfg.RANDOM_PERIOD !== undefined)
+    document.getElementById('dk_RANDOM_PERIOD').value = cfg.RANDOM_PERIOD;
+  if (cfg.ENABLE_RANDOM !== undefined)
+    document.getElementById('dk_ENABLE_RANDOM').checked = cfg.ENABLE_RANDOM;
   // Pre-fill trigger ms from drumkit's MIN_ON_MS
   if (cfg.MIN_ON_MS !== undefined)
     document.getElementById('triggerMs').value = cfg.MIN_ON_MS;
@@ -134,6 +139,8 @@ document.getElementById('drumkitForm').addEventListener('submit', e => {
     MAX_ON_MS:        parseFloat(document.getElementById('dk_MAX_ON_MS').value),
     MIN_RETRIGGER_MS: parseFloat(document.getElementById('dk_MIN_RETRIGGER_MS').value),
     PAD_CONFIG:       padConfig,
+    RANDOM_PERIOD:    parseInt(document.getElementById('dk_RANDOM_PERIOD').value) || 500,
+    ENABLE_RANDOM:    document.getElementById('dk_ENABLE_RANDOM').checked,
   });
   // drumkit's message_callback_add is registered for the exact base topic
   client.publish(`${MQTT_BASE}`, payload, { qos: 0, retain: false });
@@ -151,6 +158,47 @@ document.getElementById('gpioForm').addEventListener('submit', e => {
   client.publish(`${MQTT_BASE}/poofer`, payload, { qos: 0, retain: true });
   flashSaved('gpioSaveStatus');
 });
+
+// ── RANDOM 5s button ─────────────────────────────────────
+
+(function () {
+  const btn = document.getElementById('randomBtn');
+  let countdownInterval = null;
+
+  window.cancelRandom = function () {
+    if (!countdownInterval) return;
+    clearInterval(countdownInterval);
+    countdownInterval = null;
+    client.publish(MQTT_BASE, JSON.stringify({ ENABLE_RANDOM: false }), { qos: 0, retain: false });
+    document.getElementById('dk_ENABLE_RANDOM').checked = false;
+    btn.disabled = false;
+    btn.textContent = 'RANDOM 5s';
+  };
+
+  btn.addEventListener('click', () => {
+    if (countdownInterval) return;  // already running
+    client.publish(MQTT_BASE, JSON.stringify({ ENABLE_RANDOM: true }), { qos: 0, retain: false });
+    document.getElementById('dk_ENABLE_RANDOM').checked = true;
+
+    let remaining = 5;
+    btn.disabled = true;
+    btn.textContent = `RANDOM ${remaining}s…`;
+
+    countdownInterval = setInterval(() => {
+      remaining--;
+      if (remaining > 0) {
+        btn.textContent = `RANDOM ${remaining}s…`;
+      } else {
+        clearInterval(countdownInterval);
+        countdownInterval = null;
+        client.publish(MQTT_BASE, JSON.stringify({ ENABLE_RANDOM: false }), { qos: 0, retain: false });
+        document.getElementById('dk_ENABLE_RANDOM').checked = false;
+        btn.disabled = false;
+        btn.textContent = 'RANDOM 5s';
+      }
+    }, 1000);
+  });
+})();
 
 // ── MQTT ───────────────────────────────────────────────────
 

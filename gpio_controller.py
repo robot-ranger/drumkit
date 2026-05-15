@@ -125,7 +125,10 @@ class GPIOController:
                         await self._on_message(message)
         except asyncio.CancelledError:
             logging.info("Shutdown signal received")
+        except aiomqtt.MqttError as exc:
+            logging.error("Broker disconnected unexpectedly: %s — turning off all relays", exc)
         finally:
+            self._client = None
             await self._shutdown()
 
     async def _shutdown(self) -> None:

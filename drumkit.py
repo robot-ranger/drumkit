@@ -5,6 +5,8 @@ Publishes pad hits to MQTT topics for ESP32 relay nodes to consume
 """
 
 import json
+import random
+import threading
 import time
 from time import sleep
 import mido
@@ -41,6 +43,8 @@ class Settings(BaseSettings):
         49,
         51
     ]
+    ENABLE_RANDOM: bool = False  # whether random rhythm is active
+    RANDOM_PERIOD: int = 500   # ms between random hits
 
 settings = Settings()
 
@@ -59,6 +63,27 @@ def select_port() -> str:
     for i, p in enumerate(ports):
         print(f"  [{i}] {p}")
     return ports[int(input("Select port: "))]
+
+# ─── Random Rhythm Worker ────────────────────────────────────────────────────
+
+def rhythm_worker(get_client: callable, stop: threading.Event) -> None:
+    """Background thread: fires a random pad every RANDOM_PERIOD ms when ENABLE_RANDOM is True."""
+    while not stop.wait(0):
+        if not settings.ENABLE_RANDOM:
+            stop.wait(0.1)  # idle poll while disabled
+            continue
+        pads = settings.PAD_CONFIG
+        if not pads:
+            stop.wait(0.1)
+            continue
+        note   = random.choice(pads)
+        on_ms  = int(random.uniform(settings.MIN_ON_MS, settings.MAX_ON_MS))
+        client = get_client()
+        if client is not None:
+            topic = f"{MQTT_BASE}/pad/{note}"
+            client.publish(topic, on_ms, qos=0)
+            logging.info(f"[rhythm] {topic}:{on_ms}ms")
+        stop.wait(settings.RANDOM_PERIOD / 1000.0)
 
 # ─── MQTT Config Handler ─────────────────────────────────────────────────────
 
@@ -92,6 +117,17 @@ def main():
     client.loop_start()
     sleep(1)  # Allow time for MQTT connection to establish
     client.publish(f"{MQTT_BASE}/pad", settings.model_dump_json(), qos=0, retain=True)
+
+    _client_ref = client
+    stop_rhythm  = threading.Event()
+    rhythm_thread = threading.Thread(
+        target=rhythm_worker,
+        args=(lambda: _client_ref, stop_rhythm),
+        daemon=True,
+        name="rhythm",
+    )
+    rhythm_thread.start()
+    logging.info(f"Rhythm thread started (ENABLE_RANDOM={settings.ENABLE_RANDOM}, RANDOM_PERIOD={settings.RANDOM_PERIOD}ms)")
 
     logging.info(f"Listening on: {port_name}  →  MQTT {MQTT_BROKER}:{MQTT_PORT}/{MQTT_BASE}/\n")
 
@@ -132,6 +168,8 @@ def main():
             action = "↻ extend" if is_extend else "Activated Note →"
             logging.info(f"{action} {topic}:{payload}")
 
+    stop_rhythm.set()
+    rhythm_thread.join(timeout=1)
     client.loop_stop()
     client.disconnect()
 
