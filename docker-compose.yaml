@@ -17,7 +17,7 @@ services:
   drumkit:
       build: 
         context: .
-        dockerfile: Dockerfile.drumkit
+        dockerfile: docker/Dockerfile.drumkit
       restart: unless-stopped
       environment:
         - MQTT_BROKER=mosquitto
@@ -32,7 +32,7 @@ services:
   gpio:
       build: 
         context: .
-        dockerfile: Dockerfile.gpio
+        dockerfile: docker/Dockerfile.gpio
       restart: unless-stopped
       environment:
         - MQTT_BROKER=mosquitto
@@ -48,7 +48,7 @@ services:
   web:
     build:
       context: .
-      dockerfile: Dockerfile.web
+      dockerfile: docker/Dockerfile.web
     restart: unless-stopped
     ports:
       - '8000:80'

@@ -6,6 +6,7 @@ Publishes pad hits to MQTT topics for ESP32 relay nodes to consume
 
 import json
 import random
+import sys
 import threading
 import time
 from time import sleep
@@ -55,14 +56,25 @@ def velocity_to_ms(velocity: int) -> float:
     return settings.MIN_ON_MS + (settings.MAX_ON_MS - settings.MIN_ON_MS) * ((v - 1) / 126)
 
 def select_port() -> str:
-    ports = mido.get_input_names()
+    ports = [p for p in mido.get_input_names() if "Midi Through" not in p]
     if not ports:
         raise RuntimeError("No MIDI input ports found.")
     if len(ports) == 1:
+        logging.info(f"Auto-selected MIDI port: {ports[0]}")
         return ports[0]
     for i, p in enumerate(ports):
-        print(f"  [{i}] {p}")
-    return ports[int(input("Select port: "))]
+        logging.info(f"  [{i}] {p}")
+    midi_port_env = os.getenv("MIDI_PORT")
+    if midi_port_env is None:
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except Exception:
+            pass
+        return ports[int(input("Select port: "))]
+    else:
+        logging.info(f"Using MIDI_PORT from env: {midi_port_env}")
+        return midi_port_env
 
 # ─── Random Rhythm Worker ────────────────────────────────────────────────────
 
@@ -107,8 +119,7 @@ def on_config(client, userdata, msg):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # port_name = select_port()
-    port_name = "Stryke 6:Stryke 6 MIDI 1 16:0"  # DEV OVERRIDE
+    port_name = select_port()
     logging.info(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} with base topic '{MQTT_BASE}/'")
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="midi-bridge")
     client.connect(MQTT_BROKER, MQTT_PORT)

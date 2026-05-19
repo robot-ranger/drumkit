@@ -8,6 +8,6 @@ RUN pip install --no-cache-dir \
     pydantic-settings \
     rpi-lgpio
 
-COPY gpio_controller.py .
+COPY src/gpio_controller.py .
 
 CMD ["python", "gpio_controller.py"]

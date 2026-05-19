@@ -16,6 +16,6 @@ RUN pip install --no-cache-dir \
     paho-mqtt \
     pydantic-settings
 
-COPY drumkit.py .
+COPY src/drumkit.py .
 
 CMD ["python", "drumkit.py"]
